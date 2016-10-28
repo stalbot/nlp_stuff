@@ -1,0 +1,6 @@
+[package]
+name = "nlp_stuff"
+version = "0.1.0"
+authors = ["Steven <steven@pelotoncycle.com>"]
+
+[dependencies]
