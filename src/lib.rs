@@ -2,15 +2,17 @@ use std::collections::BinaryHeap;
 use std::collections::BTreeMap;
 use std::collections::HashMap;
 use std::iter::FromIterator;
-use std::collections::hash_map::OccupiedEntry;
 use std::cmp::Ord;
 use std::cmp::Ordering;
+
+const START_STATE_LABEL : &'static str = "$S";
+const MINIMUM_ABSOLUTE_PROB : f32 = 0.00001;
 
 #[derive(Debug)]
 struct PCFGProduction {
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct SemanticEntry {
 }
 
@@ -40,18 +42,18 @@ impl<'a> PartialEq for ParseState<'a> {
 }
 impl<'a> Eq for ParseState<'a>{}
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct ParseNode<'a> {
-    label: &'a str,
-    production: Option<PCFGProduction>,
+    label: &'a GrammarLabel,
+    production: Option<&'a PCFGProduction>,
     children: Vec<ParseNode<'a>>,
-    features: &'a Features<'a>
+    features: Features<'a>
 }
 
 type LemmaName = str;
 type SynsetName = str;
 type BareWord = str;
-type GrammarKey = str;
+type GrammarLabel = str;
 
 #[derive(Debug)]
 struct Lemma {
@@ -90,14 +92,17 @@ struct GlobalParseData<'a> {
 }
 
 #[derive(Debug)]
-struct PcfgEntry {
+struct PcfgEntry<'a> {
+    parents_total_count: f32,
+    parents: HashMap<(&'a GrammarLabel, usize), f32>,
+    productions: Vec<PCFGProduction>
 }
 
 type LexicalLkup<'a> = HashMap<&'a BareWord, HashMap<&'a SynsetName, f32>>;
 type SynsetLkup<'a> = HashMap<&'a SynsetName, Synset<'a>>;
-type Pcfg<'a> = HashMap<&'a GrammarKey, PcfgEntry>;
+type Pcfg<'a> = HashMap<&'a GrammarLabel, PcfgEntry<'a>>;
 
-#[derive(Hash, Debug, Eq, PartialEq)]
+#[derive(Hash, Debug, Eq, PartialEq, Clone)]
 struct Features<'a> (
     // requires hashability
     BTreeMap<&'a str, &'a str>
@@ -157,7 +162,7 @@ fn create_first_states<'a, 'b>(global_data: &'b GlobalParseData<'a>,
                        .map(|(features, pos, weighted_synsets, prob)| {
         let start_sem = sem_for_lex_node(global_data, weighted_synsets, None);
         let lex_node = ParseNode{ label: word,
-                                  features: features,
+                                  features: features.clone(),
                                   production: None,
                                   children: Vec::new() };
 
@@ -166,12 +171,78 @@ fn create_first_states<'a, 'b>(global_data: &'b GlobalParseData<'a>,
             semantics: start_sem,
             node: ParseNode {
                 label: pos.into_label(),
-                features: features,
+                features: features.clone(),
                 production: None,
                 children: vec![lex_node]
             }
         }
     }).collect()
+}
+
+fn make_next_initial_state<'a, 'b>(pcfg: &'a Pcfg,
+                                   parent_label: &'a GrammarLabel,
+                                   parse_state: &'b ParseState<'a>,
+                                   production: &'a PCFGProduction,
+                                   new_prob: f32)
+                                   -> ParseState<'a> {
+    ParseState{
+        semantics: parse_state.semantics.clone(),
+        prob: new_prob,
+        node: ParseNode {
+            label: parent_label,
+            production: Some(production),
+            children: vec![parse_state.node.clone()],
+            features: parse_state.node.features.clone() // TODO not fully right
+        }
+    }
+}
+
+fn parents_with_normed_probs<'a>(pcfg: &'a Pcfg, label: &'a GrammarLabel)
+        -> Vec<(&'a GrammarLabel, &'a PCFGProduction, f32)> {
+    // it is a programmer error to have an invalid label leak in here
+    let pcfg_entry = pcfg.get(label).unwrap();
+    pcfg_entry.parents.iter().map(|(&(parent_label, prod_index), &count)| {
+        let normalized_count = count / pcfg_entry.parents_total_count;
+        let production = pcfg.get(parent_label)
+                             .unwrap()
+                             .productions
+                             .get(prod_index)
+                             .unwrap();
+        (parent_label, production, normalized_count)
+    }).collect() // TODO: sort by count
+}
+
+fn infer_initial_possible_states<'a, 'b>(global_data: &'b GlobalParseData<'a>,
+                                         word: &'a BareWord,
+                                         beam_size: usize)
+                                         -> BinaryHeap<ParseState<'b>> {
+    let mut found_states = BinaryHeap::new();
+    let mut frontier = create_first_states(global_data, word);
+    while found_states.len() < beam_size && !frontier.is_empty() {
+        let parse_state = frontier.pop().unwrap(); // not-empty b/c while()
+        let current_label = parse_state.node.label;
+        let state_parents = parents_with_normed_probs(&global_data.pcfg,
+                                                      current_label);
+
+        for (parent_label, production, prob) in state_parents {
+            let absolute_prob = prob * parse_state.prob;
+            if absolute_prob < MINIMUM_ABSOLUTE_PROB {
+                continue;
+            }
+
+            let parent_state = make_next_initial_state(&global_data.pcfg,
+                                                       parent_label,
+                                                       &parse_state,
+                                                       production,
+                                                       absolute_prob);
+            if parent_label == START_STATE_LABEL {
+                found_states.push(parent_state);
+            } else {
+                frontier.push(parent_state);
+            }
+        }
+    }
+    found_states
 }
 
 #[cfg(test)]
