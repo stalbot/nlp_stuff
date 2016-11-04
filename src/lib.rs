@@ -4,6 +4,10 @@ use std::collections::HashMap;
 use std::iter::FromIterator;
 use std::cmp::Ord;
 use std::cmp::Ordering;
+use std::ops::{Add, Mul};
+
+extern crate itertools;
+use itertools::Itertools;
 
 const START_STATE_LABEL : &'static str = "$S";
 const MINIMUM_ABSOLUTE_PROB : f32 = 0.00001;
@@ -201,7 +205,9 @@ fn parents_with_normed_probs<'a>(pcfg: &'a Pcfg, label: &'a GrammarLabel)
         -> Vec<(&'a GrammarLabel, &'a PCFGProduction, f32)> {
     // it is a programmer error to have an invalid label leak in here
     let pcfg_entry = pcfg.get(label).unwrap();
-    pcfg_entry.parents.iter().map(|(&(parent_label, prod_index), &count)| {
+    let mut parents = pcfg_entry.parents
+                                .iter()
+                                .map(|(&(parent_label, prod_index), &count)| {
         let normalized_count = count / pcfg_entry.parents_total_count;
         let production = pcfg.get(parent_label)
                              .unwrap()
@@ -209,7 +215,11 @@ fn parents_with_normed_probs<'a>(pcfg: &'a Pcfg, label: &'a GrammarLabel)
                              .get(prod_index)
                              .unwrap();
         (parent_label, production, normalized_count)
-    }).collect() // TODO: sort by count
+    }).collect::<Vec<_>>();
+    parents.sort_by(|&(_, _, c1), &(_, _, c2)|
+        c1.partial_cmp(&c2).expect("probs should compare")
+    );
+    parents
 }
 
 fn infer_initial_possible_states<'a, 'b>(global_data: &'b GlobalParseData<'a>,
@@ -243,6 +253,84 @@ fn infer_initial_possible_states<'a, 'b>(global_data: &'b GlobalParseData<'a>,
         }
     }
     found_states
+}
+
+fn parse_word<'a>(global_data: &'a GlobalParseData<'a>,
+                  states: Vec<ParseState<'a>>,
+                  word: &'a BareWord,
+                  beam_size: usize)
+                  -> Vec<ParseState<'a>> {
+    let word_posses = possible_parts_of_speech_for_word(global_data, word);
+    let next_possible_states = infer_possible_states_mult(
+                                    global_data,
+                                    states,
+                                    beam_size,
+                                    &word_posses);
+    update_state_probs_for_word(global_data, next_possible_states, word)
+}
+
+fn possible_parts_of_speech_for_word(global_data: &GlobalParseData,
+                                     word: &BareWord)
+                                     -> Vec<PartOfSpeech> {
+    // TODO!
+    vec![PartOfSpeech::Noun, PartOfSpeech::Verb, PartOfSpeech::Adj, PartOfSpeech::Adv]
+}
+
+fn infer_possible_states_mult<'a, 'b>(global_data: &'a GlobalParseData,
+                                      states: Vec<ParseState<'a>>,
+                                      beam_size: usize,
+                                      word_posses: &'b Vec<PartOfSpeech>)
+                                      -> Vec<ParseState<'a>> {
+    let new_states = states.into_iter().flat_map(|state|
+        infer_possible_states(global_data, state, beam_size, word_posses)
+    );
+    let mut new_states = new_states.sorted_by(|s1, s2|
+        s1.prob.partial_cmp(&s2.prob).expect("probs should compare")
+    );
+    new_states.truncate(beam_size);
+    new_states
+}
+
+fn infer_possible_states<'a, 'b>(global_data: &'a GlobalParseData,
+                                 state: ParseState<'a>,
+                                 beam_size: usize,
+                                 word_posses: &'b Vec<PartOfSpeech>)
+                                 -> Vec<ParseState<'a>> {
+    let mut found = vec![];
+    let mut frontier = BinaryHeap::new();
+    frontier.push(state);
+
+    while let Some(current_state) = frontier.pop() {
+        if found.len() >= beam_size {
+            break;
+        }
+
+        get_successor_states(
+            global_data,
+            current_state,
+            &mut found,
+            &mut frontier,
+            word_posses
+        )
+    }
+    vec![]
+}
+
+fn get_successor_states<'a, 'b>(global_data: &'a GlobalParseData,
+                                state: ParseState<'a>,
+                                found: &mut Vec<ParseState<'a>>,
+                                frontier: &mut BinaryHeap<ParseState<'a>>,
+                                word_posses: &'b Vec<PartOfSpeech>)
+                                -> ()
+{
+    ()
+}
+
+fn update_state_probs_for_word<'a>(global_data: &'a GlobalParseData,
+                                   states: Vec<ParseState<'a>>,
+                                   word: &'a BareWord)
+                                   -> Vec<ParseState<'a>> {
+    Vec::new()
 }
 
 #[cfg(test)]
