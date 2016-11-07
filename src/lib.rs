@@ -5,6 +5,7 @@ use std::iter::FromIterator;
 use std::cmp::Ord;
 use std::cmp::Ordering;
 use std::ops::{Add, Mul};
+use std::rc::Rc;
 
 extern crate itertools;
 use itertools::Itertools;
@@ -20,38 +21,125 @@ struct PCFGProduction {
 struct SemanticEntry {
 }
 
+trait HasProbability {
+    fn get_prob(&self) -> f32;
+}
+
 #[derive(Debug)]
 struct ParseState<'a> {
     prob: f32,
-    node: ParseNode<'a>,
+    features: Features<'a>,
+    node_stack: Vec<ParseNode<'a>>,
+    prior_parse: Vec<ParsedToken<'a>>,
     semantics: SemanticEntry
+}
+
+#[derive(Debug, Clone)]
+struct TraversingParseState<'a> {
+    prob: f32,
+    features: Rc<Features<'a>>,
+    node_stack: Rc<Vec<ParseNode<'a>>>,
+    semantics: Rc<SemanticEntry>,
+    prior_parse: Rc<Vec<ParsedToken<'a>>>
+}
+
+impl<'a> HasProbability for ParseState<'a> {
+    fn get_prob(&self) -> f32 { self.prob }
+}
+impl<'a> HasProbability for TraversingParseState<'a> {
+    fn get_prob(&self) -> f32 { self.prob }
+}
+
+impl<'a> ParseState<'a> {
+    fn to_traversable(self) -> TraversingParseState<'a> {
+        TraversingParseState {
+            prob: self.prob,
+            features: Rc::new(self.features),
+            node_stack: Rc::new(self.node_stack),
+            semantics: Rc::new(self.semantics),
+            prior_parse: Rc::new(self.prior_parse)
+        }
+    }
+}
+
+impl<'a> TraversingParseState<'a> {
+    fn to_stable(self) -> ParseState<'a> {
+        ParseState {
+            prob: self.prob,
+            features: match Rc::try_unwrap(self.features) {
+                Ok(features) => features,
+                Err(rc) => (*rc).clone()
+            },
+            node_stack: match Rc::try_unwrap(self.node_stack) {
+                Ok(node_stack) => node_stack,
+                Err(rc) => (*rc).clone()
+            },
+            semantics: match Rc::try_unwrap(self.semantics) {
+                Ok(semantics) => semantics,
+                Err(rc) => (*rc).clone()
+            },
+            prior_parse: match Rc::try_unwrap(self.prior_parse) {
+                Ok(prior_parse) => prior_parse,
+                Err(rc) => (*rc).clone()
+            }
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct ParsedToken<'a> {
+    word: &'a BareWord,
+    features: Features<'a>,
+    pos: PartOfSpeech
 }
 
 impl<'a> Ord for ParseState<'a> {
     fn cmp(&self, other: &ParseState) -> Ordering {
-        self.prob.partial_cmp(&other.prob).unwrap_or(Ordering::Equal)
+        self.get_prob()
+            .partial_cmp(&other.get_prob())
+            .unwrap_or(Ordering::Equal)
     }
 }
 
 impl<'a> PartialOrd for ParseState<'a> {
     fn partial_cmp(&self, other: &ParseState) -> Option<Ordering> {
-        self.prob.partial_cmp(&other.prob)
+        self.get_prob().partial_cmp(&other.get_prob())
     }
 }
 
 impl<'a> PartialEq for ParseState<'a> {
     fn eq(&self, other: &ParseState) -> bool {
-        self.prob == other.prob
+        self.get_prob() == other.get_prob()
     }
 }
-impl<'a> Eq for ParseState<'a>{}
+impl<'a> Eq for ParseState<'a> {}
+
+// TODO: clobber this duplication with a macro
+impl<'a> Ord for TraversingParseState<'a> {
+    fn cmp(&self, other: &TraversingParseState) -> Ordering {
+        self.get_prob()
+            .partial_cmp(&other.get_prob())
+            .unwrap_or(Ordering::Equal)
+    }
+}
+
+impl<'a> PartialOrd for TraversingParseState<'a> {
+    fn partial_cmp(&self, other: &TraversingParseState) -> Option<Ordering> {
+        self.get_prob().partial_cmp(&other.get_prob())
+    }
+}
+
+impl<'a> PartialEq for TraversingParseState<'a> {
+    fn eq(&self, other: &TraversingParseState) -> bool {
+        self.get_prob() == other.get_prob()
+    }
+}
+impl<'a> Eq for TraversingParseState<'a> {}
 
 #[derive(Debug, Clone)]
 struct ParseNode<'a> {
     label: &'a GrammarLabel,
-    production: Option<&'a PCFGProduction>,
-    children: Vec<ParseNode<'a>>,
-    features: Features<'a>
+    production: Option<&'a PCFGProduction>
 }
 
 type LemmaName = str;
@@ -159,45 +247,49 @@ fn sem_for_lex_node<'a>(global_data: &'a GlobalParseData,
 
 fn create_first_states<'a, 'b>(global_data: &'b GlobalParseData<'a>,
                                word: &'a BareWord)
-                               -> BinaryHeap<ParseState<'b>> {
+                               -> BinaryHeap<TraversingParseState<'b>> {
     let synsets_by_function = synsets_split_by_function(global_data, word);
 
     synsets_by_function.into_iter()
                        .map(|(features, pos, weighted_synsets, prob)| {
         let start_sem = sem_for_lex_node(global_data, weighted_synsets, None);
-        let lex_node = ParseNode{ label: word,
-                                  features: features.clone(),
-                                  production: None,
-                                  children: Vec::new() };
-
         ParseState {
             prob: prob,
             semantics: start_sem,
-            node: ParseNode {
-                label: pos.into_label(),
-                features: features.clone(),
-                production: None,
-                children: vec![lex_node]
-            }
-        }
+            features: features.clone(),
+            node_stack: vec![
+                ParseNode {
+                    label: pos.into_label(),
+                    production: None
+                }
+            ],
+            prior_parse: vec![
+                ParsedToken {
+                    word: word,
+                    features: features.clone(),
+                    pos: pos
+                }
+            ]
+        }.to_traversable()
     }).collect()
 }
 
 fn make_next_initial_state<'a, 'b>(pcfg: &'a Pcfg,
                                    parent_label: &'a GrammarLabel,
-                                   parse_state: &'b ParseState<'a>,
+                                   mut parse_state: TraversingParseState<'a>,
                                    production: &'a PCFGProduction,
                                    new_prob: f32)
-                                   -> ParseState<'a> {
-    ParseState{
-        semantics: parse_state.semantics.clone(),
+                                   -> TraversingParseState<'a> {
+    Rc::make_mut(&mut parse_state.node_stack).push(ParseNode {
+        production: Some(production),
+        label: parent_label
+    });
+    TraversingParseState {
+        semantics: parse_state.semantics,
+        features: parse_state.features, // TODO not fully right
         prob: new_prob,
-        node: ParseNode {
-            label: parent_label,
-            production: Some(production),
-            children: vec![parse_state.node.clone()],
-            features: parse_state.node.features.clone() // TODO not fully right
-        }
+        prior_parse: parse_state.prior_parse,
+        node_stack: parse_state.node_stack
     }
 }
 
@@ -229,12 +321,28 @@ fn infer_initial_possible_states<'a, 'b>(global_data: &'b GlobalParseData<'a>,
     let mut found_states = BinaryHeap::new();
     let mut frontier = create_first_states(global_data, word);
     while found_states.len() < beam_size && !frontier.is_empty() {
-        let parse_state = frontier.pop().unwrap(); // not-empty b/c while()
-        let current_label = parse_state.node.label;
-        let state_parents = parents_with_normed_probs(&global_data.pcfg,
-                                                      current_label);
+        // this value will be not-empty b/c of the while()
+        let mut parse_state_opt = frontier.pop();
 
-        for (parent_label, production, prob) in state_parents {
+        let state_parents = {
+            let parse_state = parse_state_opt.as_ref().unwrap();
+            // guaranteed node_stack not-empty b/c always populated in create_first_states
+            let current_label = parse_state.node_stack.last().unwrap().label;
+            parents_with_normed_probs(&global_data.pcfg, current_label)
+        };
+
+        // Jump through some hoops so that on the last iteration of the
+        // loop, there is one owned parse_state, and any Rc in it with just a single
+        // reference can be mutated directly, rather than copied
+        for (ii, &(parent_label, production, prob))
+                in state_parents.iter().enumerate() {
+            let parse_state = parse_state_opt.unwrap();
+            parse_state_opt = if ii == state_parents.len() - 1 {
+                Some(parse_state.clone())
+            } else {
+                None
+            };
+
             let absolute_prob = prob * parse_state.prob;
             if absolute_prob < MINIMUM_ABSOLUTE_PROB {
                 continue;
@@ -242,7 +350,7 @@ fn infer_initial_possible_states<'a, 'b>(global_data: &'b GlobalParseData<'a>,
 
             let parent_state = make_next_initial_state(&global_data.pcfg,
                                                        parent_label,
-                                                       &parse_state,
+                                                       parse_state,
                                                        production,
                                                        absolute_prob);
             if parent_label == START_STATE_LABEL {
@@ -252,7 +360,7 @@ fn infer_initial_possible_states<'a, 'b>(global_data: &'b GlobalParseData<'a>,
             }
         }
     }
-    found_states
+    found_states.into_iter().map(|f| f.to_stable()).collect()
 }
 
 fn parse_word<'a>(global_data: &'a GlobalParseData<'a>,
