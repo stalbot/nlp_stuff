@@ -21,10 +21,6 @@ struct PCFGProduction {
 struct SemanticEntry {
 }
 
-trait HasProbability {
-    fn get_prob(&self) -> f32;
-}
-
 #[derive(Debug)]
 struct ParseState<'a> {
     prob: f32,
@@ -41,13 +37,6 @@ struct TraversingParseState<'a> {
     node_stack: Rc<Vec<ParseNode<'a>>>,
     semantics: Rc<SemanticEntry>,
     prior_parse: Rc<Vec<ParsedToken<'a>>>
-}
-
-impl<'a> HasProbability for ParseState<'a> {
-    fn get_prob(&self) -> f32 { self.prob }
-}
-impl<'a> HasProbability for TraversingParseState<'a> {
-    fn get_prob(&self) -> f32 { self.prob }
 }
 
 impl<'a> ParseState<'a> {
