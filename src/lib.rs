@@ -12,9 +12,13 @@ use itertools::Itertools;
 
 const START_STATE_LABEL : &'static str = "$S";
 const MINIMUM_ABSOLUTE_PROB : f32 = 0.00001;
+const MINIMUM_PROB_RATIO : f32 = 0.01;
+const PARENT_PROB_PENALTY : f32 = 0.9;
 
 #[derive(Debug)]
-struct PCFGProduction {
+struct PCFGProduction<'a> {
+    elements: Vec<&'a PcfgEntry<'a>>,
+    count: f32
 }
 
 #[derive(Debug, Clone)]
@@ -49,6 +53,11 @@ impl<'a> ParseState<'a> {
             prior_parse: Rc::new(self.prior_parse)
         }
     }
+
+    fn with_reversed_stack(mut self) -> ParseState<'a> {
+        self.node_stack.reverse();
+        self
+    }
 }
 
 impl<'a> TraversingParseState<'a> {
@@ -73,6 +82,26 @@ impl<'a> TraversingParseState<'a> {
             }
         }
     }
+
+    fn with_next_node(mut self,
+                      top_node: &ParseNode<'a>,
+                      next_label: &'a GrammarLabel,
+                      production: Option<&'a PCFGProduction>)
+                      -> TraversingParseState<'a> {
+        {
+            let stack = Rc::make_mut(&mut self.node_stack);
+            let mut new_top = top_node.clone();
+            new_top.num_children += 1;
+
+            stack.push(new_top);
+            stack.push(ParseNode {
+                label: next_label,
+                production: production,
+                num_children: 0
+            });
+        }
+        self
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -84,21 +113,21 @@ struct ParsedToken<'a> {
 
 impl<'a> Ord for ParseState<'a> {
     fn cmp(&self, other: &ParseState) -> Ordering {
-        self.get_prob()
-            .partial_cmp(&other.get_prob())
+        self.prob
+            .partial_cmp(&other.prob)
             .unwrap_or(Ordering::Equal)
     }
 }
 
 impl<'a> PartialOrd for ParseState<'a> {
     fn partial_cmp(&self, other: &ParseState) -> Option<Ordering> {
-        self.get_prob().partial_cmp(&other.get_prob())
+        self.prob.partial_cmp(&other.prob)
     }
 }
 
 impl<'a> PartialEq for ParseState<'a> {
     fn eq(&self, other: &ParseState) -> bool {
-        self.get_prob() == other.get_prob()
+        self.prob == other.prob
     }
 }
 impl<'a> Eq for ParseState<'a> {}
@@ -106,21 +135,21 @@ impl<'a> Eq for ParseState<'a> {}
 // TODO: clobber this duplication with a macro
 impl<'a> Ord for TraversingParseState<'a> {
     fn cmp(&self, other: &TraversingParseState) -> Ordering {
-        self.get_prob()
-            .partial_cmp(&other.get_prob())
+        self.prob
+            .partial_cmp(&other.prob)
             .unwrap_or(Ordering::Equal)
     }
 }
 
 impl<'a> PartialOrd for TraversingParseState<'a> {
     fn partial_cmp(&self, other: &TraversingParseState) -> Option<Ordering> {
-        self.get_prob().partial_cmp(&other.get_prob())
+        self.prob.partial_cmp(&other.prob)
     }
 }
 
 impl<'a> PartialEq for TraversingParseState<'a> {
     fn eq(&self, other: &TraversingParseState) -> bool {
-        self.get_prob() == other.get_prob()
+        self.prob == other.prob
     }
 }
 impl<'a> Eq for TraversingParseState<'a> {}
@@ -128,7 +157,8 @@ impl<'a> Eq for TraversingParseState<'a> {}
 #[derive(Debug, Clone)]
 struct ParseNode<'a> {
     label: &'a GrammarLabel,
-    production: Option<&'a PCFGProduction>
+    num_children: usize,
+    production: Option<&'a PCFGProduction<'a>>
 }
 
 type LemmaName = str;
@@ -154,6 +184,16 @@ impl PartOfSpeech {
             PartOfSpeech::Adv => "$R"
         }
     }
+
+    fn from_label(label: &str) -> Option<PartOfSpeech> {
+        match label {
+            "$N" => Some(PartOfSpeech::Noun),
+            "$V" => Some(PartOfSpeech::Verb),
+            "$A" => Some(PartOfSpeech::Adj),
+            "$R" => Some(PartOfSpeech::Adv),
+            _ => None
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -176,7 +216,10 @@ struct GlobalParseData<'a> {
 struct PcfgEntry<'a> {
     parents_total_count: f32,
     parents: HashMap<(&'a GrammarLabel, usize), f32>,
-    productions: Vec<PCFGProduction>
+    label: &'a GrammarLabel,
+    productions_count_total: f32,
+    productions: Vec<PCFGProduction<'a>>,
+    is_lex_node: bool
 }
 
 type LexicalLkup<'a> = HashMap<&'a BareWord, HashMap<&'a SynsetName, f32>>;
@@ -249,6 +292,7 @@ fn create_first_states<'a, 'b>(global_data: &'b GlobalParseData<'a>,
             node_stack: vec![
                 ParseNode {
                     label: pos.into_label(),
+                    num_children: 1,
                     production: None
                 }
             ],
@@ -271,6 +315,7 @@ fn make_next_initial_state<'a, 'b>(pcfg: &'a Pcfg,
                                    -> TraversingParseState<'a> {
     Rc::make_mut(&mut parse_state.node_stack).push(ParseNode {
         production: Some(production),
+        num_children: 1,
         label: parent_label
     });
     TraversingParseState {
@@ -283,7 +328,7 @@ fn make_next_initial_state<'a, 'b>(pcfg: &'a Pcfg,
 }
 
 fn parents_with_normed_probs<'a>(pcfg: &'a Pcfg, label: &'a GrammarLabel)
-        -> Vec<(&'a GrammarLabel, &'a PCFGProduction, f32)> {
+        -> Vec<(&'a GrammarLabel, &'a PCFGProduction<'a>, f32)> {
     // it is a programmer error to have an invalid label leak in here
     let pcfg_entry = pcfg.get(label).unwrap();
     let mut parents = pcfg_entry.parents
@@ -349,7 +394,10 @@ fn infer_initial_possible_states<'a, 'b>(global_data: &'b GlobalParseData<'a>,
             }
         }
     }
-    found_states.into_iter().map(|f| f.to_stable()).collect()
+    found_states.into_iter().map(|state| {
+        // For perf, we built our stacks in the wrong order
+        state.to_stable().with_reversed_stack()
+    }).collect()
 }
 
 fn parse_word<'a>(global_data: &'a GlobalParseData<'a>,
@@ -395,11 +443,24 @@ fn infer_possible_states<'a, 'b>(global_data: &'a GlobalParseData,
                                  -> Vec<ParseState<'a>> {
     let mut found = vec![];
     let mut frontier = BinaryHeap::new();
-    frontier.push(state);
+    let mut best_prob_opt : Option<f32> = None;
+    frontier.push(state.to_traversable());
 
     while let Some(current_state) = frontier.pop() {
         if found.len() >= beam_size {
             break;
+        }
+
+        // We stop collecting if the best intermediate state we've got is less
+        // than X times as likely as the best we've found
+        // TODO: this could be more efficient if checked b4 put on frontier
+        if let Some(best_prob) = best_prob_opt {
+            if current_state.prob / best_prob < MINIMUM_PROB_RATIO {
+                break;
+            }
+        } else {
+            best_prob_opt = found.first().map(|st : &TraversingParseState|
+                                              st.prob);
         }
 
         get_successor_states(
@@ -410,17 +471,117 @@ fn infer_possible_states<'a, 'b>(global_data: &'a GlobalParseData,
             word_posses
         )
     }
-    vec![]
+    found.into_iter().map(|f| f.to_stable()).collect()
+}
+
+fn get_parent_state<'a>(global_data: &'a GlobalParseData,
+                        mut state: TraversingParseState<'a>)
+                        -> Option<TraversingParseState<'a>> {
+    if let Some(_) = Rc::make_mut(&mut state.node_stack).pop() {
+        Some(state)
+    } else {
+        None
+    }
+}
+
+fn is_term_sym(label: &GrammarLabel) -> bool {
+   !label.starts_with("$")
 }
 
 fn get_successor_states<'a, 'b>(global_data: &'a GlobalParseData,
-                                state: ParseState<'a>,
-                                found: &mut Vec<ParseState<'a>>,
-                                frontier: &mut BinaryHeap<ParseState<'a>>,
+                                mut state: TraversingParseState<'a>,
+                                found: &mut Vec<TraversingParseState<'a>>,
+                                frontier: &mut BinaryHeap<TraversingParseState<'a>>,
                                 word_posses: &'b Vec<PartOfSpeech>)
                                 -> ()
 {
+    // Can just return if this is None
+    let top_node = match Rc::make_mut(&mut state.node_stack).pop() {
+        Some(top_node) => top_node,
+        None => return
+    };
+    let prod_child_count = top_node.production
+                                   .map(|prod| prod.elements.len())
+                                   .unwrap_or(0);
+    if top_node.num_children >= prod_child_count {
+        if let Some(parent_state) = get_parent_state(global_data, state) {
+            frontier.push(parent_state);
+        }
+    } else {
+        get_successor_child_states(global_data,
+                                   state,
+                                   found,
+                                   frontier,
+                                   word_posses,
+                                   top_node);
+    }
+}
+
+fn set_next_features<'a>(features: &mut Rc<Features<'a>>,
+                         next_entry: &PcfgEntry) -> () {
+    // TODO!
     ()
+}
+
+fn set_next_semantics<'a>(global_data: &'a GlobalParseData,
+                          state: &mut TraversingParseState) -> () {
+    // TODO!
+    ()
+}
+
+fn get_successor_child_states<'a, 'b>(global_data: &'a GlobalParseData,
+                                      mut state: TraversingParseState<'a>,
+                                      found: &mut Vec<TraversingParseState<'a>>,
+                                      frontier: &mut BinaryHeap<TraversingParseState<'a>>,
+                                      word_posses: &'b Vec<PartOfSpeech>,
+                                      top_node: ParseNode<'a>)
+                                      -> () {
+    let num_children = top_node.num_children;
+    let next_production = &top_node.production.expect("b/c otherwise 0 above, this isn't amazing style though");
+    let next_entry = next_production.elements[num_children];
+    let next_label = next_entry.label;
+    set_next_features(&mut state.features, next_entry);
+    set_next_semantics(global_data, &mut state);
+
+    if next_entry.is_lex_node || is_term_sym(next_label) {
+        let pos_for_label = PartOfSpeech::from_label(next_label);
+        if let Some(pos) = pos_for_label {
+            if word_posses.contains(&pos) || word_posses.is_empty() {
+                found.push(state.with_next_node(&top_node, next_label, None));
+            }
+        } else {
+            found.push(state.with_next_node(&top_node, next_label, None));
+        }
+    } else {
+        add_next_intermediate_states(state, frontier, next_entry, top_node);
+    }
+}
+
+fn add_next_intermediate_states<'a>(mut state: TraversingParseState<'a>,
+                                    frontier: &mut BinaryHeap<TraversingParseState<'a>>,
+                                    next_entry: &'a PcfgEntry,
+                                    top_node: ParseNode<'a>) -> () {
+    let new_productions = &next_entry.productions;
+    // Same trick again, provide the mutable state for re-use in the last
+    // iteration of the loop
+    let mut parse_state_opt = Some(state);
+    let last_index = new_productions.len() - 1;
+    for (ii, production) in new_productions.iter().enumerate() {
+        let mut state = parse_state_opt.unwrap();
+        parse_state_opt = if ii == last_index {
+            Some(state.clone())
+        } else {
+            None
+        };
+
+        state.prob *= (production.count / next_entry.productions_count_total) *
+                       PARENT_PROB_PENALTY;
+        if state.prob >= MINIMUM_ABSOLUTE_PROB {
+            frontier.push(state.with_next_node(&top_node,
+                                               next_entry.label,
+                                               Some(production)));
+        }
+    }
 }
 
 fn update_state_probs_for_word<'a>(global_data: &'a GlobalParseData,
