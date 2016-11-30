@@ -1,6 +1,4 @@
-use std::collections::BinaryHeap;
-use std::collections::BTreeMap;
-use std::collections::HashMap;
+use std::collections::{BinaryHeap, BTreeMap, HashMap};
 use std::iter::FromIterator;
 use std::cmp::Ord;
 use std::cmp::Ordering;
@@ -9,6 +7,9 @@ use std::rc::Rc;
 
 extern crate itertools;
 use itertools::Itertools;
+
+extern crate rayon;
+use rayon::prelude::*;
 
 const START_STATE_LABEL : &'static str = "$S";
 const MINIMUM_ABSOLUTE_PROB : f32 = 0.00001;
@@ -426,10 +427,14 @@ fn infer_possible_states_mult<'a, 'b>(global_data: &'a GlobalParseData,
                                       beam_size: usize,
                                       word_posses: &'b Vec<PartOfSpeech>)
                                       -> Vec<ParseState<'a>> {
-    let new_states = states.into_iter().flat_map(|state|
+    let mut new_states = vec![];
+    states.into_par_iter().map(|state|
         infer_possible_states(global_data, state, beam_size, word_posses)
-    );
-    let mut new_states = new_states.sorted_by(|s1, s2|
+    ).collect_into(&mut new_states);
+
+    let mut new_states = new_states.into_iter()
+                                   .flat_map(|s| s)
+                                   .sorted_by(|s1, s2|
         s1.prob.partial_cmp(&s2.prob).expect("probs should compare")
     );
     new_states.truncate(beam_size);
