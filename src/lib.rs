@@ -1,7 +1,6 @@
 use std::collections::{BinaryHeap, BTreeMap, HashMap};
 use std::iter::FromIterator;
-use std::cmp::Ord;
-use std::cmp::Ordering;
+use std::cmp::{Ord, Ordering};
 use std::ops::{Add, Mul};
 use std::rc::Rc;
 
@@ -172,9 +171,10 @@ struct Lemma {
     count: f32
 }
 
-#[derive(Eq, PartialEq, Hash, Debug, Clone)]
+#[derive(Eq, PartialEq, Hash, Debug, Clone, Copy)]
 enum PartOfSpeech {
-    Noun, Verb, Adj, Adv
+    // Token is for filler words that fall directly out of grammar
+    Noun, Verb, Adj, Adv, Token
 }
 impl PartOfSpeech {
     fn into_label(&self) -> &'static str {
@@ -182,7 +182,8 @@ impl PartOfSpeech {
             PartOfSpeech::Noun => "$N",
             PartOfSpeech::Verb => "$V",
             PartOfSpeech::Adj => "$A",
-            PartOfSpeech::Adv => "$R"
+            PartOfSpeech::Adv => "$R",
+            PartOfSpeech::Token => "$TOK"
         }
     }
 
@@ -271,11 +272,11 @@ fn synsets_split_by_function<'a, 'b>(
 }
 
 fn sem_for_lex_node<'a>(global_data: &'a GlobalParseData,
-                        weighted_synsets: HashMap<&'a SynsetName, f32>,
-                        existing_sem: Option<SemanticEntry>
-                        ) -> SemanticEntry {
+                        weighted_synsets: &HashMap<&'a SynsetName, f32>,
+                        existing_sem: Option<&SemanticEntry>
+                        ) -> (SemanticEntry, f32) {
     // TODO: obviously implement this!
-    SemanticEntry{}
+    (SemanticEntry{}, 1.0)
 }
 
 fn create_first_states<'a, 'b>(global_data: &'b GlobalParseData<'a>,
@@ -285,7 +286,9 @@ fn create_first_states<'a, 'b>(global_data: &'b GlobalParseData<'a>,
 
     synsets_by_function.into_iter()
                        .map(|(features, pos, weighted_synsets, prob)| {
-        let start_sem = sem_for_lex_node(global_data, weighted_synsets, None);
+        let (start_sem, _) = sem_for_lex_node(global_data,
+                                              &weighted_synsets,
+                                              None);
         ParseState {
             prob: prob,
             semantics: start_sem,
@@ -412,7 +415,10 @@ fn parse_word<'a>(global_data: &'a GlobalParseData<'a>,
                                     states,
                                     beam_size,
                                     &word_posses);
-    update_state_probs_for_word(global_data, next_possible_states, word)
+    update_state_probs_for_word(global_data,
+                                next_possible_states,
+                                word,
+                                beam_size)
 }
 
 fn possible_parts_of_speech_for_word(global_data: &GlobalParseData,
@@ -589,11 +595,98 @@ fn add_next_intermediate_states<'a>(mut state: TraversingParseState<'a>,
     }
 }
 
+fn features_match(f1: &Features, f2: &Features) -> bool {
+    true // TODOOOOOOO!!!
+}
+
+fn update_state_probs_with_lex_node<'a, 'b>(
+        global_data: &'a GlobalParseData,
+        mut state: TraversingParseState<'a>,
+        synset_info: &(&'b Features<'a>, PartOfSpeech, HashMap<&'a str, f32>, f32),
+        word: &'a BareWord)
+        -> Option<TraversingParseState<'a>>  {
+    let label = state.node_stack.last().unwrap().label;
+    let &(features, pos, ref syns_to_probs, prob_adj) = synset_info;
+
+    if label == pos.into_label() && features_match(features, &state.features) {
+        let (new_sem, sem_adj_prob) = sem_for_lex_node(global_data,
+                                                       syns_to_probs,
+                                                       Some(&state.semantics));
+        state.prob *= sem_adj_prob * prob_adj;
+        Rc::make_mut(&mut state.prior_parse).push(
+            ParsedToken {
+                word: word,
+                features: features.clone(),
+                pos: pos
+            }
+        );
+        Some(state)
+    } else {
+        None
+    }
+}
+
+fn check_state_against_synsets<'a, 'b>(
+        global_data: &'a GlobalParseData,
+        state: ParseState<'a>,
+        synsets_info: &Vec<(&'b Features<'a>, PartOfSpeech, HashMap<&'a str, f32>, f32)>,
+        word: &'a BareWord)
+        -> Vec<TraversingParseState<'a>>  {
+    // All nodes at this point have nodes
+    let label = state.node_stack.last().unwrap().label;
+    let mut state = state.to_traversable();
+
+    if is_term_sym(label) && label == word {
+        Rc::make_mut(&mut state.prior_parse).push(
+            ParsedToken {
+                word: word,
+                features: (*state.features).clone(),
+                pos: PartOfSpeech::Token
+            }
+        );
+        vec![state]
+    } else {
+        // And one more time with this nonsense trick
+        let mut states_for_ret = vec![];
+        let mut parse_state_opt = Some(state);
+        for (ii, info) in synsets_info.iter().enumerate() {
+            let state = parse_state_opt.unwrap();
+            parse_state_opt = if ii == synsets_info.len() - 1 {
+                Some(state.clone())
+            } else {
+                None
+            };
+            if let Some(state) = update_state_probs_with_lex_node(global_data,
+                                                                  state,
+                                                                  info,
+                                                                  word) {
+                states_for_ret.push(state);
+            }
+        }
+        states_for_ret
+    }
+}
+
 fn update_state_probs_for_word<'a>(global_data: &'a GlobalParseData,
                                    states: Vec<ParseState<'a>>,
-                                   word: &'a BareWord)
+                                   word: &'a BareWord,
+                                   beam_size: usize)
                                    -> Vec<ParseState<'a>> {
-    Vec::new()
+    let synsets_info = synsets_split_by_function(global_data, word);
+
+    let mut updated_states = states.into_iter().flat_map(|state|
+        check_state_against_synsets(global_data, state, &synsets_info, word)
+    ).sorted_by(|s1, s2|
+        s1.prob.partial_cmp(&s2.prob).expect("probs should compare")
+    );
+    updated_states.truncate(beam_size);
+
+    let prob_total = updated_states.iter().map(|s| s.prob).sum();
+
+    updated_states.into_iter().map(|mut state| {
+        state.prob /= prob_total;
+        state.to_stable()
+    }).collect()
 }
 
 #[cfg(test)]
