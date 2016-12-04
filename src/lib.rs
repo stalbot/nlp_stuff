@@ -1,8 +1,10 @@
-use std::collections::{BinaryHeap, BTreeMap, HashMap};
+mod common;
+use common::*;
+
+use std::collections::{BinaryHeap, HashMap};
 use std::iter::FromIterator;
-use std::ops::Index;
-use std::cmp::{Ord, Ordering};
 use std::rc::Rc;
+use std::cmp::{Ord, Ordering};
 
 extern crate itertools;
 use itertools::Itertools;
@@ -10,43 +12,17 @@ use itertools::Itertools;
 extern crate rayon;
 use rayon::prelude::*;
 
-const START_STATE_LABEL : &'static str = "$S";
-const MINIMUM_ABSOLUTE_PROB : f32 = 0.00001;
-const MINIMUM_PROB_RATIO : f32 = 0.01;
-const PARENT_PROB_PENALTY : f32 = 0.9;
-
-#[derive(Debug)]
-struct PCFGProduction<'a> {
-    elements: Vec<&'a PcfgEntry<'a>>,
-    count: f32,
-    head: Option<usize>,
-    full_features: Vec<&'a str>
-}
-
 #[derive(Debug, Clone)]
-struct SemanticEntry {
-}
-
-#[derive(Debug)]
-pub struct ParseState<'a> {
-    prob: f32,
-    features: Features<'a>,
-    node_stack: Vec<ParseNode<'a>>,
-    prior_parse: Vec<ParsedToken<'a>>,
-    semantics: SemanticEntry
-}
-
-#[derive(Debug, Clone)]
-struct TraversingParseState<'a> {
-    prob: f32,
-    features: Rc<Features<'a>>,
-    node_stack: Rc<Vec<ParseNode<'a>>>,
-    semantics: Rc<SemanticEntry>,
-    prior_parse: Rc<Vec<ParsedToken<'a>>>
+pub struct TraversingParseState<'a> {
+    pub prob: f32,
+    pub features: Rc<Features<'a>>,
+    pub node_stack: Rc<Vec<ParseNode<'a>>>,
+    pub semantics: Rc<SemanticEntry>,
+    pub prior_parse: Rc<Vec<ParsedToken<'a>>>
 }
 
 impl<'a> ParseState<'a> {
-    fn to_traversable(self) -> TraversingParseState<'a> {
+    pub fn to_traversable(self) -> TraversingParseState<'a> {
         TraversingParseState {
             prob: self.prob,
             features: Rc::new(self.features),
@@ -56,14 +32,14 @@ impl<'a> ParseState<'a> {
         }
     }
 
-    fn with_reversed_stack(mut self) -> ParseState<'a> {
+    pub fn with_reversed_stack(mut self) -> ParseState<'a> {
         self.node_stack.reverse();
         self
     }
 }
 
 impl<'a> TraversingParseState<'a> {
-    fn to_stable(self) -> ParseState<'a> {
+    pub fn to_stable(self) -> ParseState<'a> {
         ParseState {
             prob: self.prob,
             features: match Rc::try_unwrap(self.features) {
@@ -85,7 +61,7 @@ impl<'a> TraversingParseState<'a> {
         }
     }
 
-    fn with_next_node(mut self,
+    pub fn with_next_node(mut self,
                       top_node: &ParseNode<'a>,
                       next_label: &'a GrammarLabel,
                       production: Option<&'a PCFGProduction>)
@@ -106,35 +82,7 @@ impl<'a> TraversingParseState<'a> {
     }
 }
 
-#[derive(Debug, Clone)]
-struct ParsedToken<'a> {
-    word: &'a BareWord,
-    features: Features<'a>,
-    pos: PartOfSpeech
-}
-
-impl<'a> Ord for ParseState<'a> {
-    fn cmp(&self, other: &ParseState) -> Ordering {
-        self.prob
-            .partial_cmp(&other.prob)
-            .unwrap_or(Ordering::Equal)
-    }
-}
-
-impl<'a> PartialOrd for ParseState<'a> {
-    fn partial_cmp(&self, other: &ParseState) -> Option<Ordering> {
-        self.prob.partial_cmp(&other.prob)
-    }
-}
-
-impl<'a> PartialEq for ParseState<'a> {
-    fn eq(&self, other: &ParseState) -> bool {
-        self.prob == other.prob
-    }
-}
-impl<'a> Eq for ParseState<'a> {}
-
-// TODO: clobber this duplication with a macro
+// TODO: clobber this duplication with common.rs with a macro
 impl<'a> Ord for TraversingParseState<'a> {
     fn cmp(&self, other: &TraversingParseState) -> Ordering {
         self.prob
@@ -155,121 +103,6 @@ impl<'a> PartialEq for TraversingParseState<'a> {
     }
 }
 impl<'a> Eq for TraversingParseState<'a> {}
-
-#[derive(Debug, Clone)]
-struct ParseNode<'a> {
-    label: &'a GrammarLabel,
-    num_children: usize,
-    production: Option<&'a PCFGProduction<'a>>
-}
-
-impl<'a> ParseNode<'a> {
-    fn is_head(&self) -> bool {
-        if let Some(production) = self.production {
-            if let Some(head_index) = production.head {
-                head_index == self.num_children - 1
-            } else {
-                self.num_children == production.elements.len()
-            }
-        }
-        else {
-            // Not sure if this case would ever make it here
-            true
-        }
-    }
-}
-
-pub type LemmaName = str;
-pub type SynsetName = str;
-pub type BareWord = str;
-pub type GrammarLabel = str;
-
-#[derive(Debug)]
-struct Lemma {
-    count: f32
-}
-
-#[derive(Eq, PartialEq, Hash, Debug, Clone, Copy)]
-enum PartOfSpeech {
-    // Token is for filler words that fall directly out of grammar
-    Noun, Verb, Adj, Adv, Token
-}
-impl PartOfSpeech {
-    fn into_label(&self) -> &'static str {
-        match *self {
-            PartOfSpeech::Noun => "$N",
-            PartOfSpeech::Verb => "$V",
-            PartOfSpeech::Adj => "$A",
-            PartOfSpeech::Adv => "$R",
-            PartOfSpeech::Token => "$TOK"
-        }
-    }
-
-    fn from_label(label: &str) -> Option<PartOfSpeech> {
-        match label {
-            "$N" => Some(PartOfSpeech::Noun),
-            "$V" => Some(PartOfSpeech::Verb),
-            "$A" => Some(PartOfSpeech::Adj),
-            "$R" => Some(PartOfSpeech::Adv),
-            _ => None
-        }
-    }
-}
-
-#[derive(Debug)]
-pub struct Synset<'a> {
-    features: Features<'a>,
-    lemmas: HashMap<&'a LemmaName, Lemma>,
-    total_count: f32,
-    pos: PartOfSpeech,
-    name: &'a SynsetName
-}
-
-#[derive(Debug)]
-pub struct GlobalParseData<'a> {
-    pcfg: Pcfg<'a>,
-    synset_lkup: SynsetLkup<'a>,
-    lexical_kup: LexicalLkup<'a>
-}
-
-#[derive(Debug)]
-pub struct PcfgEntry<'a> {
-    parents_total_count: f32,
-    parents: HashMap<(&'a GrammarLabel, usize), f32>,
-    label: &'a GrammarLabel,
-    productions_count_total: f32,
-    productions: Vec<PCFGProduction<'a>>,
-    is_lex_node: bool,
-    features: Features<'a>
-}
-
-pub type LexicalLkup<'a> = HashMap<&'a BareWord, HashMap<&'a SynsetName, f32>>;
-pub type SynsetLkup<'a> = HashMap<&'a SynsetName, Synset<'a>>;
-pub type Pcfg<'a> = HashMap<&'a GrammarLabel, PcfgEntry<'a>>;
-
-#[derive(Hash, Debug, Eq, PartialEq, Clone)]
-struct Features<'a> (
-    // requires hashability
-    BTreeMap<&'a str, &'a str>
-);
-
-impl<'a> Features<'a> {
-    fn features_match(&self, f2: &Features) -> bool {
-        self.0.iter().all(|(k1, v1)|
-            match f2.0.get(k1) {
-                Some(v2) => v2 == v1,
-                None => true
-            }
-        )
-    }
-
-    fn merge_mut(&mut self, features: &Features<'a>) {
-        for (k, v) in &features.0 {
-            self.0.insert(k, v);
-        }
-    }
-}
-
 
 
 fn synsets_split_by_function<'a, 'b>(
@@ -597,16 +430,18 @@ fn set_next_features<'a>(state: &mut TraversingParseState<'a>,
                                  .map(|p| &p.features);
     let features = Rc::make_mut(&mut state.features);
     if !current_node.is_head() {
-        features.0.clear();
+        features.clear();
     }
     if let Some(previous_features) = previous_features {
         if let Some(full_features) = current_node.production
                                                  .map(|p| &p.full_features) {
             for feature_name in full_features {
-                if !features.0.contains_key(feature_name)
-                        && previous_features.0.contains_key(feature_name) {
-                    features.0.insert(feature_name,
-                                      previous_features.0[feature_name]);
+                if !features.has_feature(feature_name)
+                        && previous_features.has_feature(feature_name) {
+                    features.add_feature(
+                        feature_name,
+                        previous_features.get_feature_value(feature_name)
+                    )
                 }
             }
         }
