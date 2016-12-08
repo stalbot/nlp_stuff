@@ -1,5 +1,7 @@
 mod common;
 use common::*;
+mod pcfg_compiler;
+// use pcfg_compiler::{parse_pcfg, parse_lexicon};
 
 use std::collections::{BinaryHeap, HashMap};
 use std::iter::FromIterator;
@@ -9,13 +11,15 @@ use std::cmp::{Ord, Ordering};
 extern crate itertools;
 use itertools::Itertools;
 
+extern crate rustc_serialize;
+
 extern crate rayon;
 use rayon::prelude::*;
 
 #[derive(Debug, Clone)]
 pub struct TraversingParseState<'a> {
     pub prob: f32,
-    pub features: Rc<Features<'a>>,
+    pub features: Rc<Features>,
     pub node_stack: Rc<Vec<ParseNode<'a>>>,
     pub semantics: Rc<SemanticEntry>,
     pub prior_parse: Rc<Vec<ParsedToken<'a>>>
@@ -63,7 +67,7 @@ impl<'a> TraversingParseState<'a> {
 
     pub fn with_next_node(mut self,
                       top_node: &ParseNode<'a>,
-                      next_label: &'a GrammarLabel,
+                      next_label: &'a str,
                       production: Option<&'a PCFGProduction>)
                       -> TraversingParseState<'a> {
         {
@@ -106,8 +110,8 @@ impl<'a> Eq for TraversingParseState<'a> {}
 
 
 fn synsets_split_by_function<'a, 'b>(
-        global_data: &'b GlobalParseData<'a>, word: &'a BareWord)
-        -> Vec<(&'b Features<'a>, PartOfSpeech, HashMap<&'a str, f32>, f32)> {
+        global_data: &'b GlobalParseData, word: &'a str)
+        -> Vec<(&'b Features, PartOfSpeech, HashMap<&'b str, f32>, f32)> {
     if let Some(lemma_counts) = global_data.lexical_kup.get(word) {
         let mut grouper = HashMap::new();
         let total_count = 0.0;
@@ -128,7 +132,7 @@ fn synsets_split_by_function<'a, 'b>(
                                                           .sum();
             let weighted_synsets = HashMap::from_iter(
                 synsets_w_counts.iter().map(|&(synset, count)|
-                    (synset.name, count / total_group_count)
+                    (&*synset.name, count / total_group_count)
                 )
             );
 
@@ -143,7 +147,7 @@ fn synsets_split_by_function<'a, 'b>(
 }
 
 fn sem_for_lex_node<'a>(global_data: &'a GlobalParseData,
-                        weighted_synsets: &HashMap<&'a SynsetName, f32>,
+                        weighted_synsets: &HashMap<&'a str, f32>,
                         existing_sem: &mut SemanticEntry
                         ) -> f32 {
     // TODO: obviously implement this!
@@ -156,9 +160,9 @@ fn get_start_sem() -> SemanticEntry {
     }
 }
 
-fn create_first_states<'a, 'b>(global_data: &'b GlobalParseData<'a>,
-                               word: &'a BareWord)
-                               -> BinaryHeap<TraversingParseState<'b>> {
+fn create_first_states<'a>(global_data: &'a GlobalParseData,
+                           word: &'a str)
+                           -> BinaryHeap<TraversingParseState<'a>> {
     let synsets_by_function = synsets_split_by_function(global_data, word);
 
     synsets_by_function.into_iter()
@@ -190,7 +194,7 @@ fn create_first_states<'a, 'b>(global_data: &'b GlobalParseData<'a>,
 }
 
 fn make_next_initial_state<'a, 'b>(pcfg: &'a Pcfg,
-                                   parent_label: &'a GrammarLabel,
+                                   parent_label: &'a str,
                                    mut parse_state: TraversingParseState<'a>,
                                    production: &'a PCFGProduction,
                                    new_prob: f32)
@@ -202,7 +206,7 @@ fn make_next_initial_state<'a, 'b>(pcfg: &'a Pcfg,
     });
     TraversingParseState {
         semantics: parse_state.semantics,
-        // TODO not fully right, needs :isolate_features junk
+        // TODO not fully right, needs :isolate_features junk from pcfg
         features: parse_state.features,
         prob: new_prob,
         prior_parse: parse_state.prior_parse,
@@ -210,20 +214,20 @@ fn make_next_initial_state<'a, 'b>(pcfg: &'a Pcfg,
     }
 }
 
-fn parents_with_normed_probs<'a>(pcfg: &'a Pcfg, label: &'a GrammarLabel)
-        -> Vec<(&'a GrammarLabel, &'a PCFGProduction<'a>, f32)> {
+fn parents_with_normed_probs<'a>(pcfg: &'a Pcfg, label: &'a str)
+        -> Vec<(&'a str, &'a PCFGProduction, f32)> {
     // it is a programmer error to have an invalid label leak in here
     let pcfg_entry = pcfg.get(label).unwrap();
     let mut parents = pcfg_entry.parents
                                 .iter()
-                                .map(|(&(parent_label, prod_index), &count)| {
+                                .map(|(&(ref parent_label, prod_index), &count)| {
         let normalized_count = count / pcfg_entry.parents_total_count;
-        let production = pcfg.get(parent_label)
+        let production = pcfg.get(parent_label as &str)
                              .unwrap()
                              .productions
                              .get(prod_index)
                              .unwrap();
-        (parent_label, production, normalized_count)
+        (parent_label as &str, production, normalized_count)
     }).collect::<Vec<_>>();
     parents.sort_by(|&(_, _, c1), &(_, _, c2)|
         c1.partial_cmp(&c2).expect("probs should compare")
@@ -231,10 +235,10 @@ fn parents_with_normed_probs<'a>(pcfg: &'a Pcfg, label: &'a GrammarLabel)
     parents
 }
 
-fn infer_initial_possible_states<'a, 'b>(global_data: &'b GlobalParseData<'a>,
-                                         word: &'a BareWord,
-                                         beam_size: usize)
-                                         -> Vec<ParseState<'b>> {
+fn infer_initial_possible_states<'a>(global_data: &'a GlobalParseData,
+                                     word: &'a str,
+                                     beam_size: usize)
+                                    -> Vec<ParseState<'a>> {
     let mut found_states = BinaryHeap::new();
     let mut frontier = create_first_states(global_data, word);
     while found_states.len() < beam_size && !frontier.is_empty() {
@@ -283,9 +287,9 @@ fn infer_initial_possible_states<'a, 'b>(global_data: &'b GlobalParseData<'a>,
     }).collect()
 }
 
-fn parse_word<'a>(global_data: &'a GlobalParseData<'a>,
+fn parse_word<'a>(global_data: &'a GlobalParseData,
                   states: Vec<ParseState<'a>>,
-                  word: &'a BareWord,
+                  word: &'a str,
                   beam_size: usize)
                   -> Vec<ParseState<'a>> {
     let word_posses = possible_parts_of_speech_for_word(global_data, word);
@@ -300,8 +304,8 @@ fn parse_word<'a>(global_data: &'a GlobalParseData<'a>,
                                 beam_size)
 }
 
-pub fn parse_sentence_fragment<'a>(global_data: &'a GlobalParseData<'a>,
-                                   sentence: Vec<&'a BareWord>,
+pub fn parse_sentence_fragment<'a>(global_data: &'a GlobalParseData,
+                                   sentence: Vec<&'a str>,
                                    beam_size: usize)
                                    -> Vec<ParseState<'a>> {
     let first_word = sentence.first().expect("fragment not empty");
@@ -316,7 +320,7 @@ pub fn parse_sentence_fragment<'a>(global_data: &'a GlobalParseData<'a>,
 }
 
 fn possible_parts_of_speech_for_word(global_data: &GlobalParseData,
-                                     word: &BareWord)
+                                     word: &str)
                                      -> Vec<PartOfSpeech> {
     // TODO!
     vec![PartOfSpeech::Noun, PartOfSpeech::Verb, PartOfSpeech::Adj, PartOfSpeech::Adv]
@@ -389,7 +393,7 @@ fn get_parent_state<'a>(mut state: TraversingParseState<'a>)
     }
 }
 
-fn is_term_sym(label: &GrammarLabel) -> bool {
+fn is_term_sym(label: &str) -> bool {
    !label.starts_with("$")
 }
 
@@ -423,7 +427,7 @@ fn get_successor_states<'a, 'b>(global_data: &'a GlobalParseData,
 }
 
 fn set_next_features<'a>(state: &mut TraversingParseState<'a>,
-                         next_entry: &PcfgEntry<'a>,
+                         next_element: &ProductionElement,
                          current_node: &ParseNode<'a>) -> () {
     let previous_features = state.prior_parse
                                  .last()
@@ -446,7 +450,7 @@ fn set_next_features<'a>(state: &mut TraversingParseState<'a>,
             }
         }
     }
-    features.merge_mut(&next_entry.features);
+    features.merge_mut(&next_element.features);
 }
 
 fn set_next_semantics<'a>(global_data: &'a GlobalParseData,
@@ -464,9 +468,10 @@ fn get_successor_child_states<'a, 'b>(global_data: &'a GlobalParseData,
                                       -> () {
     let num_children = top_node.num_children;
     let next_production = &top_node.production.expect("b/c otherwise 0 above, this isn't amazing style though");
-    let next_entry = next_production.elements[num_children];
-    let next_label = next_entry.label;
-    set_next_features(&mut state, next_entry, &top_node);
+    let next_element = &next_production.elements[num_children];
+    let next_entry = global_data.pcfg.get(&next_element.label).unwrap();
+    let next_label = &next_entry.label as &str;
+    set_next_features(&mut state, &next_element, &top_node);
     set_next_semantics(global_data, &mut state);
 
     if next_entry.is_lex_node || is_term_sym(next_label) {
@@ -504,7 +509,7 @@ fn add_next_intermediate_states<'a>(state: TraversingParseState<'a>,
                        PARENT_PROB_PENALTY;
         if state.prob >= MINIMUM_ABSOLUTE_PROB {
             frontier.push(state.with_next_node(&top_node,
-                                               next_entry.label,
+                                               &next_entry.label,
                                                Some(production)));
         }
     }
@@ -513,8 +518,8 @@ fn add_next_intermediate_states<'a>(state: TraversingParseState<'a>,
 fn update_state_probs_with_lex_node<'a, 'b>(
         global_data: &'a GlobalParseData,
         mut state: TraversingParseState<'a>,
-        synset_info: &(&'b Features<'a>, PartOfSpeech, HashMap<&'a str, f32>, f32),
-        word: &'a BareWord)
+        synset_info: &(&'b Features, PartOfSpeech, HashMap<&'a str, f32>, f32),
+        word: &'a str)
         -> Option<TraversingParseState<'a>>  {
     let label = state.node_stack.last().unwrap().label;
     let &(features, pos, ref syns_to_probs, prob_adj) = synset_info;
@@ -540,8 +545,8 @@ fn update_state_probs_with_lex_node<'a, 'b>(
 fn check_state_against_synsets<'a, 'b>(
         global_data: &'a GlobalParseData,
         state: ParseState<'a>,
-        synsets_info: &Vec<(&'b Features<'a>, PartOfSpeech, HashMap<&'a str, f32>, f32)>,
-        word: &'a BareWord)
+        synsets_info: &Vec<(&'b Features, PartOfSpeech, HashMap<&'a str, f32>, f32)>,
+        word: &'a str)
         -> Vec<TraversingParseState<'a>>  {
     // All states at this point have nodes
     let label = state.node_stack.last().unwrap().label;
@@ -580,7 +585,7 @@ fn check_state_against_synsets<'a, 'b>(
 
 fn update_state_probs_for_word<'a>(global_data: &'a GlobalParseData,
                                    states: Vec<ParseState<'a>>,
-                                   word: &'a BareWord,
+                                   word: &'a str,
                                    beam_size: usize)
                                    -> Vec<ParseState<'a>> {
     let synsets_info = synsets_split_by_function(global_data, word);

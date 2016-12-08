@@ -1,38 +1,42 @@
 use std::cmp::{Ord, Ordering};
 use std::collections::{BTreeMap, HashMap};
 
-use std::rc::Rc;
-
 pub const START_STATE_LABEL : &'static str = "$S";
 pub const MINIMUM_ABSOLUTE_PROB : f32 = 0.00001;
 pub const MINIMUM_PROB_RATIO : f32 = 0.01;
 pub const PARENT_PROB_PENALTY : f32 = 0.9;
 
-#[derive(Debug)]
-pub struct PCFGProduction<'a> {
-    pub elements: Vec<&'a PcfgEntry<'a>>,
+#[derive(Debug, RustcEncodable, RustcDecodable)]
+pub struct PCFGProduction {
     pub count: f32,
     pub head: Option<usize>,
-    pub full_features: Vec<&'a str>
+    pub full_features: Vec<String>,
+    pub elements: Vec<ProductionElement>
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, RustcEncodable, RustcDecodable)]
+pub struct ProductionElement {
+    pub label: String,
+    pub features: Features
+}
+
+#[derive(Debug, RustcEncodable, RustcDecodable, Clone)]
 pub struct SemanticEntry {
 }
 
-#[derive(Debug)]
+#[derive(Debug, RustcEncodable)]
 pub struct ParseState<'a> {
     pub prob: f32,
-    pub features: Features<'a>,
+    pub features: Features,
     pub node_stack: Vec<ParseNode<'a>>,
     pub prior_parse: Vec<ParsedToken<'a>>,
     pub semantics: SemanticEntry
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, RustcEncodable, Clone)]
 pub struct ParsedToken<'a> {
-    pub word: &'a BareWord,
-    pub features: Features<'a>,
+    pub word: &'a str,
+    pub features: Features,
     pub pos: PartOfSpeech
 }
 
@@ -57,11 +61,11 @@ impl<'a> PartialEq for ParseState<'a> {
 }
 impl<'a> Eq for ParseState<'a> {}
 
-#[derive(Debug, Clone)]
+#[derive(Debug, RustcEncodable, Clone)]
 pub struct ParseNode<'a> {
-    pub label: &'a GrammarLabel,
+    pub label: &'a str,
     pub num_children: usize,
-    pub production: Option<&'a PCFGProduction<'a>>
+    pub production: Option<&'a PCFGProduction>
 }
 
 impl<'a> ParseNode<'a> {
@@ -80,17 +84,12 @@ impl<'a> ParseNode<'a> {
     }
 }
 
-pub type LemmaName = str;
-pub type SynsetName = str;
-pub type BareWord = str;
-pub type GrammarLabel = str;
-
-#[derive(Debug)]
+#[derive(Debug, RustcEncodable, RustcDecodable)]
 pub struct Lemma {
     pub count: f32
 }
 
-#[derive(Eq, PartialEq, Hash, Debug, Clone, Copy)]
+#[derive(Eq, PartialEq, Hash, Debug, RustcEncodable, RustcDecodable, Clone, Copy)]
 pub enum PartOfSpeech {
     // Token is for filler words that fall directly out of grammar
     Noun, Verb, Adj, Adv, Token
@@ -117,44 +116,44 @@ impl PartOfSpeech {
     }
 }
 
-#[derive(Debug)]
-pub struct Synset<'a> {
-    pub features: Features<'a>,
-    pub lemmas: HashMap<&'a LemmaName, Lemma>,
+#[derive(Debug, RustcEncodable, RustcDecodable)]
+pub struct Synset {
+    pub features: Features,
+    pub lemmas: HashMap<String, Lemma>,
     pub total_count: f32,
     pub pos: PartOfSpeech,
-    pub name: &'a SynsetName
+    pub name: String
 }
 
-#[derive(Debug)]
-pub struct GlobalParseData<'a> {
-    pub pcfg: Pcfg<'a>,
-    pub synset_lkup: SynsetLkup<'a>,
-    pub lexical_kup: LexicalLkup<'a>
+#[derive(Debug, RustcEncodable)]
+pub struct GlobalParseData {
+    pub pcfg: Pcfg,
+    pub synset_lkup: SynsetLkup,
+    pub lexical_kup: LexicalLkup
 }
 
-#[derive(Debug)]
-pub struct PcfgEntry<'a> {
+#[derive(Debug, RustcEncodable, RustcDecodable)]
+pub struct PcfgEntry {
     pub parents_total_count: f32,
-    pub parents: HashMap<(&'a GrammarLabel, usize), f32>,
-    pub label: &'a GrammarLabel,
+    pub parents: HashMap<(String, usize), f32>,
+    pub label: String,
     pub productions_count_total: f32,
-    pub productions: Vec<PCFGProduction<'a>>,
+    pub productions: Vec<PCFGProduction>,
     pub is_lex_node: bool,
-    pub features: Features<'a>
+    pub features: Features
 }
 
-pub type LexicalLkup<'a> = HashMap<&'a BareWord, HashMap<&'a SynsetName, f32>>;
-pub type SynsetLkup<'a> = HashMap<&'a SynsetName, Synset<'a>>;
-pub type Pcfg<'a> = HashMap<&'a GrammarLabel, PcfgEntry<'a>>;
+pub type LexicalLkup = HashMap<String, HashMap<String, f32>>;
+pub type SynsetLkup = HashMap<String, Synset>;
+pub type Pcfg = HashMap<String, PcfgEntry>;
 
-#[derive(Hash, Debug, Eq, PartialEq, Clone)]
-pub struct Features<'a> (
+#[derive(Hash, Debug, RustcEncodable, RustcDecodable, Eq, PartialEq, Clone)]
+pub struct Features (
     // requires hashability
-    BTreeMap<&'a str, &'a str>
+    BTreeMap<String, String>
 );
 
-impl<'a> Features<'a> {
+impl<'a> Features {
     pub fn features_match(&self, f2: &Features) -> bool {
         self.0.iter().all(|(k1, v1)|
             match f2.0.get(k1) {
@@ -164,9 +163,9 @@ impl<'a> Features<'a> {
         )
     }
 
-    pub fn merge_mut(&mut self, features: &Features<'a>) {
+    pub fn merge_mut(&mut self, features: &Features) {
         for (k, v) in &features.0 {
-            self.0.insert(k, v);
+            self.0.insert(k.clone(), v.clone());
         }
     }
 
@@ -174,12 +173,12 @@ impl<'a> Features<'a> {
         self.0.contains_key(feature_name)
     }
 
-    pub fn get_feature_value(&self, feature_name : &'a str) -> &'a str {
-        self.0[feature_name]
+    pub fn get_feature_value(&'a self, feature_name: &'a str) -> &'a str {
+        &self.0[feature_name]
     }
 
     pub fn add_feature(&mut self, feature_name : &'a str, feature_val : &'a str) {
-        self.0.insert(feature_name, feature_val);
+        self.0.insert(String::from(feature_name), String::from(feature_val));
     }
 
     pub fn clear(&mut self) {
